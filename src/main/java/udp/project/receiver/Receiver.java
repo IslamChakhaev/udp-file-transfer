@@ -6,7 +6,6 @@ import udp.project.protocol.Packet;
 import udp.project.protocol.PacketSerializer;
 import udp.project.utils.Md5Util;
 
-import java.io.File;
 import java.util.Arrays;
 
 public class Receiver {
@@ -36,6 +35,9 @@ public class Receiver {
         while (true) {
 
             byte[] rawData = udpReceiver.receive();
+
+            log.info("<- packet received size={} bytes", rawData.length);
+
             Packet packet = serializer.deserialize(rawData);
 
             int seqNr = packet.getSequenceNumber();
@@ -66,8 +68,6 @@ public class Receiver {
         }
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-
-        File file = new File(fileName);
 
         log.info("Total time: {} ms", durationMs);
 

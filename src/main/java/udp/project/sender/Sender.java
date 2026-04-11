@@ -34,6 +34,8 @@ public class Sender {
         int maxSeq = chunks.size() + 1;
         short txId = 1;
 
+        long totalBytesSent = 0;
+
         log.info("Start sending file: {}", file.getName());
         log.info("Total packets: {}", maxSeq);
 
@@ -44,8 +46,7 @@ public class Sender {
         first.setMaxSequenceNumber(maxSeq);
         first.setFileName(file.getName());
 
-        log.info("-> FIRST packet");
-        udpSender.send(serializer.serialize(first));
+        totalBytesSent += sendPacket(first, "FIRST");
 
         // DATA
         for (int i = 0; i < chunks.size(); i++) {
@@ -55,9 +56,7 @@ public class Sender {
             dataPacket.setSequenceNumber(i + 1);
             dataPacket.setData(chunks.get(i));
 
-            log.debug("-> DATA seq={}", i + 1);
-
-            udpSender.send(serializer.serialize(dataPacket));
+            totalBytesSent += sendPacket(dataPacket, "DATA");
         }
 
         // LAST
@@ -67,13 +66,26 @@ public class Sender {
         last.setMaxSequenceNumber(maxSeq);
         last.setMd5(md5);
 
-        log.info("-> LAST packet");
-        udpSender.send(serializer.serialize(last));
+        totalBytesSent += sendPacket(last, "LAST");
 
         udpSender.close();
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
         log.info("File sent in {} ms", durationMs);
+        log.info("Total bytes sent: {}", totalBytesSent);
+    }
+
+    private int sendPacket(Packet packet, String type) throws Exception {
+        byte[] bytes = serializer.serialize(packet);
+
+        log.info("-> {} seq={} size={} bytes",
+                type,
+                packet.getSequenceNumber(),
+                bytes.length);
+
+        udpSender.send(bytes);
+
+        return bytes.length;
     }
 }
