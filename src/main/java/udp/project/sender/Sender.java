@@ -31,13 +31,13 @@ public class Sender {
         byte[] md5 = Md5Util.calculateFile(filePath);
         List<byte[]> chunks = chunker.splitFile(file);
 
-        int maxSeq = chunks.size() + 1;
+        int maxSeq = chunks.size();
         short txId = 1;
 
         long totalBytesSent = 0;
 
-        log.info("Start sending file: {}", file.getName());
-        log.info("Total packets: {}", maxSeq);
+        log.info("[TX] Starting file transfer: {}", file.getName());
+        log.info("[TX] Total DATA packets to send: {}", maxSeq);
 
         // FIRST
         Packet first = new Packet();
@@ -46,7 +46,7 @@ public class Sender {
         first.setMaxSequenceNumber(maxSeq);
         first.setFileName(file.getName());
 
-        totalBytesSent += sendPacket(first, "FIRST");
+        totalBytesSent += sendPacket(first, "FIRST packet (metadata)");
 
         // DATA
         for (int i = 0; i < chunks.size(); i++) {
@@ -56,30 +56,29 @@ public class Sender {
             dataPacket.setSequenceNumber(i + 1);
             dataPacket.setData(chunks.get(i));
 
-            totalBytesSent += sendPacket(dataPacket, "DATA");
+            totalBytesSent += sendPacket(dataPacket, "DATA packet");
         }
 
         // LAST
         Packet last = new Packet();
         last.setTransmissionId(txId);
-        last.setSequenceNumber(maxSeq);
-        last.setMaxSequenceNumber(maxSeq);
+        last.setSequenceNumber(maxSeq + 1);
         last.setMd5(md5);
 
-        totalBytesSent += sendPacket(last, "LAST");
+        totalBytesSent += sendPacket(last, "LAST packet (checksum)");
 
         udpSender.close();
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
-        log.info("File sent in {} ms", durationMs);
-        log.info("Total bytes sent: {}", totalBytesSent);
+        log.info("[TX] Transfer finished in {} ms", durationMs);
+        log.info("[TX] Total bytes sent: {}", totalBytesSent);
     }
 
     private int sendPacket(Packet packet, String type) throws Exception {
         byte[] bytes = serializer.serialize(packet);
 
-        log.info("-> {} seq={} size={} bytes",
+        log.info("[TX] {} → seq={} ({} bytes)",
                 type,
                 packet.getSequenceNumber(),
                 bytes.length);

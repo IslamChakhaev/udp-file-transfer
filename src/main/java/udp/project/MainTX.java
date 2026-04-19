@@ -1,6 +1,5 @@
 package udp.project;
 
-
 import udp.project.sender.Sender;
 
 public class MainTX {
@@ -8,6 +7,7 @@ public class MainTX {
     public static void main(String[] args) {
 
         String host = "localhost";
+
         int port = 9000;
 
         String filePath = "test.txt";

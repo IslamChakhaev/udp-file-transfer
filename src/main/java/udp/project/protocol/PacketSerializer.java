@@ -13,13 +13,10 @@ public class PacketSerializer {
 
     public byte[] serialize(Packet packet) {
 
-        if (packet.getSequenceNumber() == 0) {
-            return serializeFirst(packet);
-        } else if (packet.getMd5() != null) {
-            return serializeLast(packet);
-        } else {
-            return serializeData(packet);
-        }
+        if (packet.getSequenceNumber() == 0) return serializeFirst(packet);
+        else if (packet.getMd5() != null) return serializeLast(packet);
+        else return serializeData(packet);
+
     }
 
     public Packet deserialize(byte[] bytes) {
@@ -35,24 +32,15 @@ public class PacketSerializer {
         p.setTransmissionId(transId);
         p.setSequenceNumber(seqNr);
 
-        // FIRST
-        if (seqNr == 0) {
-            deserializeFirst(buffer, p);
-        }
-        // LAST
-        else if (bytes.length == TRANSMISSION_ID_SIZE + SEQUENCE_NUMBER_SIZE + MD5_SIZE) {
-
-            deserializeLast(buffer, p);
-        }
-        // DATA
-        else {
-            deserializeData(buffer, p);
-        }
+        if (seqNr == 0) deserializeFirst(buffer, p);
+        else if (buffer.remaining() == MD5_SIZE) deserializeLast(buffer, p);
+        else deserializeData(buffer, p);
 
         return p;
     }
 
-    // FIRST
+    //  FIRST
+
     private byte[] serializeFirst(Packet p) {
 
         byte[] fileNameBytes = p.getFileName().getBytes(StandardCharsets.UTF_8);
@@ -64,7 +52,6 @@ public class PacketSerializer {
         buffer.putShort(p.getTransmissionId());
         buffer.putInt(p.getSequenceNumber());
         buffer.putInt(p.getMaxSequenceNumber());
-
         buffer.put(fileNameBytes);
 
         return buffer.array();
@@ -74,16 +61,15 @@ public class PacketSerializer {
 
         int maxSeq = buffer.getInt();
 
-        int nameLen = buffer.remaining();
-
-        byte[] nameBytes = new byte[nameLen];
+        byte[] nameBytes = new byte[buffer.remaining()];
         buffer.get(nameBytes);
 
         p.setMaxSequenceNumber(maxSeq);
         p.setFileName(new String(nameBytes, StandardCharsets.UTF_8));
     }
 
-    // DATA
+    //  DATA
+
     private byte[] serializeData(Packet p) {
 
         byte[] data = p.getData();
@@ -101,15 +87,14 @@ public class PacketSerializer {
 
     private void deserializeData(ByteBuffer buffer, Packet p) {
 
-        int dataLen = buffer.remaining();
-
-        byte[] data = new byte[dataLen];
+        byte[] data = new byte[buffer.remaining()];
         buffer.get(data);
 
         p.setData(data);
     }
 
-    //  Last
+    //  LAST
+
     private byte[] serializeLast(Packet p) {
 
         byte[] md5 = p.getMd5();
@@ -120,7 +105,6 @@ public class PacketSerializer {
 
         buffer.putShort(p.getTransmissionId());
         buffer.putInt(p.getSequenceNumber());
-
         buffer.put(md5);
 
         return buffer.array();
@@ -134,7 +118,8 @@ public class PacketSerializer {
         p.setMd5(md5);
     }
 
-    // Buffer
+    //  BUFFER
+
     private ByteBuffer createBuffer(int size) {
         ByteBuffer buffer = ByteBuffer.allocate(size);
         buffer.order(ByteOrder.BIG_ENDIAN);
