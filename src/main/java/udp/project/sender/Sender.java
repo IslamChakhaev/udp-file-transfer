@@ -20,7 +20,7 @@ public class Sender {
     private final int port;
 
     private final PacketSerializer serializer = new PacketSerializer();
-    private final FileChunker chunker = new FileChunker(16000);
+    private final FileChunker chunker = new FileChunker(1400);
 
     private final int delayMs;
 

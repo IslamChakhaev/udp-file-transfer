@@ -3,6 +3,8 @@ package udp.project.receiver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import udp.project.protocol.Packet;
+import udp.project.protocol.PacketType;
+
 import java.util.*;
 
 public class TransferSession {
@@ -29,8 +31,19 @@ public class TransferSession {
         switch (packet.getType()) {
             case FIRST -> handleFirst(packet);
             case DATA  -> handleData(packet);
-            case LAST  -> handleLast(packet);
+            case LAST  -> {
+                // A 22-byte data chunk (payload == 16 bytes) is indistinguishable from the
+                // real last packet by size alone. Re-check seq when maxSeq is known.
+                if (firstReceived && packet.getSequenceNumber() != maxSeq + 1) {
+                    packet.setType(PacketType.DATA);
+                    packet.setData(packet.getMd5());
+                    handleData(packet);
+                } else {
+                    handleLast(packet);
+                }
+            }
         }
+
     }
 
     private void handleFirst(Packet p) {
@@ -97,3 +110,4 @@ public class TransferSession {
         return transmissionId;
     }
 }
+

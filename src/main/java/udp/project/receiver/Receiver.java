@@ -14,7 +14,7 @@ public class Receiver {
 
     private static final Logger log = LoggerFactory.getLogger(Receiver.class);
 
-    private static final int BUFFER_SIZE = 32768;
+    private static final int BUFFER_SIZE = 4096;
     private static final int SOCKET_TIMEOUT_MS = 2000;
 
     private final DatagramSocket socket;
