@@ -5,15 +5,17 @@ public class Packet {
     private short transmissionId;
     private int sequenceNumber;
     private int maxSequenceNumber;
-
     private byte[] data;
     private String fileName;
     private byte[] md5;
-
     private PacketType type;
 
     public short getTransmissionId() {
         return transmissionId;
+    }
+
+    public int getUnsignedTransmissionId() {
+        return Short.toUnsignedInt(transmissionId);
     }
 
     public void setTransmissionId(short transmissionId) {
