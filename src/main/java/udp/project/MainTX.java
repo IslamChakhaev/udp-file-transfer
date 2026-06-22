@@ -6,56 +6,90 @@ import java.util.Scanner;
 
 public class MainTX {
 
-    public static void main(String[] args) throws Exception {
-        if (args.length >= 3) {
-            String host = args[0];
-            int port = Integer.parseInt(args[1]);
-            String filePath = args[2];
-            int delayMs = args.length >= 4 ? Integer.parseInt(args[3]) : 0;
-            Short txId = args.length >= 5 ? (short) Integer.parseInt(args[4]) : null;
+    private static final String DEFAULT_HOST = "127.0.0.1";
+    private static final String USAGE = "Usage: MainTX <host> <port> <filePath> [delayMs] [txId]";
 
-            Sender sender = new Sender(host, port, delayMs);
-            try {
-                sender.sendFile(filePath, txId);
-            } finally {
-                sender.close();
+    public static void main(String[] args) {
+        try {
+            if (args.length == 0) {
+                interactive();
+            } else if (args.length >= 3) {
+                fromArgs(args);
+            } else {
+                usage();
             }
-            return;
+        } catch (IllegalArgumentException e) {
+            System.err.println("Error: " + e.getMessage());
+            usage();
+        } catch (Exception e) {
+            System.err.println("TX failed: " + e.getMessage());
+            System.exit(2);
         }
+    }
 
-        Scanner scanner = new Scanner(System.in);
+    private static void fromArgs(String[] args) throws Exception {
+        String host = args[0];
+        int port = parsePort(args[1]);
+        String filePath = args[2];
+        int delayMs = args.length > 3 ? parseInt(args[3], "delayMs") : 0;
+        Short txId = args.length > 4 ? parseTxId(args[4]) : null;
 
-        System.out.print("Enter host (for local 127.0.0.1): ");
-        String host = scanner.nextLine().trim();
-        if (host.isBlank()) {
-            host = "127.0.0.1";
+        try (Sender sender = new Sender(host, port, delayMs)) {
+            sender.sendFile(filePath, txId);
         }
+    }
+
+    private static void interactive() throws Exception {
+        Scanner sc = new Scanner(System.in);
+
+        System.out.print("Enter host (empty = 127.0.0.1): ");
+        String host = sc.nextLine().trim();
+        if (host.isBlank()) host = DEFAULT_HOST;
 
         System.out.print("Enter port: ");
-        int port = Integer.parseInt(scanner.nextLine().trim());
+        int port = parsePort(sc.nextLine());
 
-        System.out.print("Enter delay (ms, 0 = no delay): ");
-        int delayMs = Integer.parseInt(scanner.nextLine().trim());
+        System.out.print("Enter delay ms (0 = no delay): ");
+        int delayMs = parseInt(sc.nextLine(), "delayMs");
 
-        Sender sender = new Sender(host, port, delayMs);
-
-        try {
+        try (Sender sender = new Sender(host, port, delayMs)) {
             while (true) {
                 System.out.print("Enter file path or 'exit': ");
-                String filePath = scanner.nextLine().trim();
-
-                if (filePath.equalsIgnoreCase("exit")) {
-                    break;
-                }
+                String filePath = sc.nextLine().trim();
+                if (filePath.equalsIgnoreCase("exit")) return;
+                if (filePath.isBlank()) continue;
 
                 try {
                     sender.sendFile(filePath);
                 } catch (Exception e) {
-                    System.out.println("TX failed: " + e.getMessage());
+                    System.err.println("TX failed: " + e.getMessage());
                 }
             }
-        } finally {
-            sender.close();
         }
+    }
+
+    private static int parsePort(String value) {
+        int port = parseInt(value, "port");
+        if (port < 1 || port > 65_535) throw new IllegalArgumentException("port must be 1..65535");
+        return port;
+    }
+
+    private static Short parseTxId(String value) {
+        int txId = parseInt(value, "txId");
+        if (txId < 0 || txId > 65_535) throw new IllegalArgumentException("txId must be 0..65535");
+        return (short) txId;
+    }
+
+    private static int parseInt(String value, String name) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(name + " must be a number");
+        }
+    }
+
+    private static void usage() {
+        System.err.println(USAGE);
+        System.exit(1);
     }
 }

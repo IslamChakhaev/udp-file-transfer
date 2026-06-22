@@ -18,232 +18,134 @@ public class PacketSerializer {
     public static final int CONTROL_HEADER_SIZE = 5;
     public static final int ACK_SIZE = CONTROL_HEADER_SIZE + 4;
 
-    public byte[] serialize(Packet packet) {
-        if (packet == null || packet.getType() == null) {
-            throw new IllegalArgumentException("Packet type is required");
+    public byte[] serialize(Packet p) {
+        return switch (p.type()) {
+            case FIRST -> {
+                byte[] name = p.fileName().getBytes(StandardCharsets.UTF_8);
+                ByteBuffer b = buf(FIRST_MIN_SIZE + name.length);
+                b.putShort(p.transmissionId()).putInt(0).putInt(p.maxSequenceNumber()).put(name);
+                yield b.array();
+            }
+            case DATA -> {
+                ByteBuffer b = buf(DATA_HEADER_SIZE + p.data().length);
+                b.putShort(p.transmissionId()).putInt(p.sequenceNumber()).put(p.data());
+                yield b.array();
+            }
+            case LAST -> {
+                ByteBuffer b = buf(LAST_SIZE);
+                b.putShort(p.transmissionId()).putInt(p.sequenceNumber()).put(p.md5());
+                yield b.array();
+            }
+        };
+    }
+
+    public byte[] serialize(ControlPacket p) {
+        return switch (p.type()) {
+            case ACK -> {
+                ByteBuffer b = buf(ACK_SIZE);
+                b.putShort(p.transmissionId()).put((byte) ControlType.ACK.getCode())
+                 .putShort((short) 1).putInt(p.ackBase());
+                yield b.array();
+            }
+            case NAK -> {
+                List<Integer> missing = p.missingSequences();
+                if (missing.size() > 350) missing = missing.subList(0, 350);
+                ByteBuffer b = buf(CONTROL_HEADER_SIZE + missing.size() * SEQUENCE_NUMBER_SIZE);
+                b.putShort(p.transmissionId()).put((byte) ControlType.NAK.getCode())
+                 .putShort((short) missing.size());
+                for (int seq : missing) b.putInt(seq);
+                yield b.array();
+            }
+            case COMPLETE -> {
+                ByteBuffer b = buf(CONTROL_HEADER_SIZE);
+                b.putShort(p.transmissionId()).put((byte) ControlType.COMPLETE.getCode())
+                 .putShort((short) 0);
+                yield b.array();
+            }
+            case ERROR -> {
+                byte[] msg = p.errorMessage() == null ? new byte[0]
+                        : p.errorMessage().getBytes(StandardCharsets.UTF_8);
+                int n = Math.min(msg.length, 65535);
+                ByteBuffer b = buf(CONTROL_HEADER_SIZE + n);
+                b.putShort(p.transmissionId()).put((byte) ControlType.ERROR.getCode())
+                 .putShort((short) n).put(msg, 0, n);
+                yield b.array();
+            }
+        };
+    }
+
+    // seq==0 → FIRST; remaining==16 AND (no context OR seq==maxSeq+1) → LAST; else → DATA
+    public Packet deserialize(byte[] bytes, int maxSeq) {
+        if (bytes == null || bytes.length < DATA_HEADER_SIZE)
+            throw new IllegalArgumentException("Packet too small");
+
+        ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        short txId = buf.getShort();
+        int seq = buf.getInt();
+
+        if (seq == 0) {
+            if (buf.remaining() < MAX_SEQUENCE_NUMBER_SIZE)
+                throw new IllegalArgumentException("Invalid FIRST packet");
+            int maxSeqNum = buf.getInt();
+            byte[] nameBytes = new byte[buf.remaining()];
+            buf.get(nameBytes);
+            if (nameBytes.length == 0)
+                throw new IllegalArgumentException("FIRST packet filename is empty");
+            return new Packet(PacketType.FIRST, txId, 0, maxSeqNum, null,
+                    new String(nameBytes, StandardCharsets.UTF_8), null);
         }
 
-        return switch (packet.getType()) {
-            case FIRST -> serializeFirst(packet);
-            case DATA -> serializeData(packet);
-            case LAST -> serializeLast(packet);
-        };
+        if (buf.remaining() == MD5_SIZE && (maxSeq < 0 || seq == maxSeq + 1)) {
+            byte[] md5 = new byte[MD5_SIZE];
+            buf.get(md5);
+            return new Packet(PacketType.LAST, txId, seq, 0, null, null, md5);
+        }
+
+        byte[] data = new byte[buf.remaining()];
+        buf.get(data);
+        if (data.length == 0) throw new IllegalArgumentException("Empty DATA packet");
+        return new Packet(PacketType.DATA, txId, seq, 0, data, null, null);
     }
 
     public Packet deserialize(byte[] bytes) {
-        if (bytes == null || bytes.length < DATA_HEADER_SIZE) {
-            throw new IllegalArgumentException("Packet too small");
-        }
-
-        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
-        Packet packet = new Packet();
-
-        short transmissionId = buffer.getShort();
-        int sequenceNumber = buffer.getInt();
-
-        packet.setTransmissionId(transmissionId);
-        packet.setSequenceNumber(sequenceNumber);
-
-        if (sequenceNumber == 0) {
-            packet.setType(PacketType.FIRST);
-            deserializeFirst(buffer, packet);
-        } else if (buffer.remaining() == MD5_SIZE) {
-            packet.setType(PacketType.LAST);
-            deserializeLast(buffer, packet);
-        } else {
-            packet.setType(PacketType.DATA);
-            deserializeData(buffer, packet);
-        }
-
-        return packet;
-    }
-
-    public byte[] serializeFirst(Packet packet) {
-        if (packet.getFileName() == null || packet.getFileName().isBlank()) {
-            throw new IllegalArgumentException("FIRST packet requires filename");
-        }
-        if (packet.getSequenceNumber() != 0) {
-            throw new IllegalArgumentException("FIRST packet sequence must be 0");
-        }
-
-        byte[] fileNameBytes = packet.getFileName().getBytes(StandardCharsets.UTF_8);
-        int size = FIRST_MIN_SIZE + fileNameBytes.length;
-
-        ByteBuffer buffer = createBuffer(size);
-        buffer.putShort(packet.getTransmissionId());
-        buffer.putInt(0);
-        buffer.putInt(packet.getMaxSequenceNumber());
-        buffer.put(fileNameBytes);
-        return buffer.array();
-    }
-
-    public byte[] serializeData(Packet packet) {
-        if (packet.getSequenceNumber() <= 0) {
-            throw new IllegalArgumentException("DATA packet sequence must be positive");
-        }
-        if (packet.getData() == null || packet.getData().length == 0) {
-            throw new IllegalArgumentException("DATA packet requires payload");
-        }
-
-        ByteBuffer buffer = createBuffer(DATA_HEADER_SIZE + packet.getData().length);
-        buffer.putShort(packet.getTransmissionId());
-        buffer.putInt(packet.getSequenceNumber());
-        buffer.put(packet.getData());
-        return buffer.array();
-    }
-
-    public byte[] serializeLast(Packet packet) {
-        if (packet.getSequenceNumber() <= 0) {
-            throw new IllegalArgumentException("LAST packet sequence must be positive");
-        }
-        if (packet.getMd5() == null || packet.getMd5().length != MD5_SIZE) {
-            throw new IllegalArgumentException("LAST packet requires 16-byte MD5");
-        }
-
-        ByteBuffer buffer = createBuffer(LAST_SIZE);
-        buffer.putShort(packet.getTransmissionId());
-        buffer.putInt(packet.getSequenceNumber());
-        buffer.put(packet.getMd5());
-        return buffer.array();
-    }
-
-    public byte[] serialize(ControlPacket packet) {
-        if (packet == null || packet.getType() == null) {
-            throw new IllegalArgumentException("Control packet type is required");
-        }
-
-        return switch (packet.getType()) {
-            case ACK -> serializeAck(packet.getTransmissionId(), packet.getAckBase());
-            case NAK -> serializeNak(packet.getTransmissionId(), packet.getMissingSequences());
-            case COMPLETE -> serializeComplete(packet.getTransmissionId());
-            case ERROR -> serializeError(packet.getTransmissionId(), packet.getErrorMessage());
-        };
-    }
-
-    public byte[] serializeAck(short transmissionId, int ackBase) {
-        ByteBuffer buffer = createBuffer(ACK_SIZE);
-        buffer.putShort(transmissionId);
-        buffer.put((byte) ControlType.ACK.getCode());
-        buffer.putShort((short) 1);
-        buffer.putInt(ackBase);
-        return buffer.array();
-    }
-
-    public byte[] serializeNak(short transmissionId, List<Integer> missingSequences) {
-        List<Integer> missing = missingSequences == null ? List.of() : missingSequences;
-        if (missing.size() > 350) {
-            missing = missing.subList(0, 350);
-        }
-
-        ByteBuffer buffer = createBuffer(CONTROL_HEADER_SIZE + missing.size() * SEQUENCE_NUMBER_SIZE);
-        buffer.putShort(transmissionId);
-        buffer.put((byte) ControlType.NAK.getCode());
-        buffer.putShort((short) missing.size());
-        for (int sequence : missing) {
-            buffer.putInt(sequence);
-        }
-        return buffer.array();
-    }
-
-    public byte[] serializeComplete(short transmissionId) {
-        ByteBuffer buffer = createBuffer(CONTROL_HEADER_SIZE);
-        buffer.putShort(transmissionId);
-        buffer.put((byte) ControlType.COMPLETE.getCode());
-        buffer.putShort((short) 0);
-        return buffer.array();
-    }
-
-    public byte[] serializeError(short transmissionId, String message) {
-        byte[] messageBytes = message == null ? new byte[0] : message.getBytes(StandardCharsets.UTF_8);
-        int count = Math.min(messageBytes.length, 65535);
-
-        ByteBuffer buffer = createBuffer(CONTROL_HEADER_SIZE + count);
-        buffer.putShort(transmissionId);
-        buffer.put((byte) ControlType.ERROR.getCode());
-        buffer.putShort((short) count);
-        buffer.put(messageBytes, 0, count);
-        return buffer.array();
+        return deserialize(bytes, -1);
     }
 
     public ControlPacket deserializeControlPacket(byte[] bytes) {
-        if (bytes == null || bytes.length < CONTROL_HEADER_SIZE) {
+        if (bytes == null || bytes.length < CONTROL_HEADER_SIZE)
             throw new IllegalArgumentException("Control packet too small");
-        }
 
-        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
-        short transmissionId = buffer.getShort();
-        ControlType type = ControlType.fromCode(Byte.toUnsignedInt(buffer.get()));
-        int count = Short.toUnsignedInt(buffer.getShort());
+        ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        short txId = buf.getShort();
+        ControlType type = ControlType.fromCode(Byte.toUnsignedInt(buf.get()));
+        int count = Short.toUnsignedInt(buf.getShort());
 
-        ControlPacket packet = new ControlPacket();
-        packet.setTransmissionId(transmissionId);
-        packet.setType(type);
-
-        switch (type) {
+        return switch (type) {
             case ACK -> {
-                if (buffer.remaining() < SEQUENCE_NUMBER_SIZE) {
+                if (buf.remaining() < SEQUENCE_NUMBER_SIZE)
                     throw new IllegalArgumentException("Invalid ACK packet");
-                }
-                packet.setAckBase(buffer.getInt());
+                yield ControlPacket.ack(txId, buf.getInt());
             }
             case NAK -> {
-                if (buffer.remaining() < count * SEQUENCE_NUMBER_SIZE) {
+                if (buf.remaining() < count * SEQUENCE_NUMBER_SIZE)
                     throw new IllegalArgumentException("Invalid NAK packet");
-                }
                 List<Integer> missing = new ArrayList<>(count);
-                for (int i = 0; i < count; i++) {
-                    missing.add(buffer.getInt());
-                }
-                packet.setMissingSequences(missing);
+                for (int i = 0; i < count; i++) missing.add(buf.getInt());
+                yield ControlPacket.nak(txId, missing);
             }
             case COMPLETE -> {
-                if (count != 0) {
-                    throw new IllegalArgumentException("Invalid COMPLETE packet");
-                }
+                if (count != 0) throw new IllegalArgumentException("Invalid COMPLETE packet");
+                yield ControlPacket.complete(txId);
             }
             case ERROR -> {
-                byte[] messageBytes = new byte[buffer.remaining()];
-                buffer.get(messageBytes);
-                packet.setErrorMessage(new String(messageBytes, StandardCharsets.UTF_8));
+                byte[] msg = new byte[buf.remaining()];
+                buf.get(msg);
+                yield ControlPacket.error(txId, new String(msg, StandardCharsets.UTF_8));
             }
-        }
-
-        return packet;
+        };
     }
 
-    private void deserializeFirst(ByteBuffer buffer, Packet packet) {
-        if (buffer.remaining() < MAX_SEQUENCE_NUMBER_SIZE) {
-            throw new IllegalArgumentException("Invalid FIRST packet");
-        }
-
-        int maxSeq = buffer.getInt();
-        byte[] fileNameBytes = new byte[buffer.remaining()];
-        buffer.get(fileNameBytes);
-
-        if (fileNameBytes.length == 0) {
-            throw new IllegalArgumentException("FIRST packet filename is empty");
-        }
-
-        packet.setMaxSequenceNumber(maxSeq);
-        packet.setFileName(new String(fileNameBytes, StandardCharsets.UTF_8));
-    }
-
-    private void deserializeData(ByteBuffer buffer, Packet packet) {
-        byte[] data = new byte[buffer.remaining()];
-        buffer.get(data);
-        if (data.length == 0) {
-            throw new IllegalArgumentException("Empty DATA packet");
-        }
-        packet.setData(data);
-    }
-
-    private void deserializeLast(ByteBuffer buffer, Packet packet) {
-        byte[] md5 = new byte[MD5_SIZE];
-        buffer.get(md5);
-        packet.setMd5(md5);
-    }
-
-    private ByteBuffer createBuffer(int size) {
+    private ByteBuffer buf(int size) {
         return ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
     }
 }

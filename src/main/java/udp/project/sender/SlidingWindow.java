@@ -2,24 +2,16 @@ package udp.project.sender;
 
 public class SlidingWindow {
 
+    private final int maxSeq;
     private int baseSeq = 1;
     private int nextSeq = 1;
-    private final int maxSeq;
-    private final int windowSize;
 
-    public SlidingWindow(int maxSeq, int windowSize) {
-        if (maxSeq < 0) {
-            throw new IllegalArgumentException("maxSeq must not be negative");
-        }
-        if (windowSize <= 0) {
-            throw new IllegalArgumentException("windowSize must be positive");
-        }
+    public SlidingWindow(int maxSeq) {
         this.maxSeq = maxSeq;
-        this.windowSize = windowSize;
     }
 
-    public boolean canSend() {
-        return nextSeq <= maxSeq && nextSeq < baseSeq + windowSize;
+    public boolean canSend(int windowSize) {
+        return windowSize > 0 && nextSeq <= maxSeq && nextSeq < baseSeq + windowSize;
     }
 
     public int nextToSend() {
@@ -31,20 +23,14 @@ public class SlidingWindow {
     }
 
     public void onAck(int ackBase) {
-        if (ackBase > baseSeq) {
-            baseSeq = Math.min(ackBase, maxSeq + 1);
-        }
-        if (nextSeq < baseSeq) {
-            nextSeq = baseSeq;
+        if (ackBase > baseSeq && ackBase <= maxSeq + 1) {
+            baseSeq = ackBase;
+            nextSeq = Math.max(nextSeq, baseSeq);
         }
     }
 
     public int getBaseSeq() {
         return baseSeq;
-    }
-
-    public int getNextSeq() {
-        return nextSeq;
     }
 
     public boolean isFinished() {

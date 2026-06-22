@@ -9,45 +9,15 @@ import java.security.NoSuchAlgorithmException;
 
 public class Md5Util {
 
-    private Md5Util() {
-    }
-
-    public static byte[] calculateFile(String filePath) throws IOException, NoSuchAlgorithmException {
-        return calculateFile(Path.of(filePath));
-    }
+    private Md5Util() {}
 
     public static byte[] calculateFile(Path path) throws IOException, NoSuchAlgorithmException {
         MessageDigest digest = MessageDigest.getInstance("MD5");
-
-        try (InputStream input = Files.newInputStream(path)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) != -1) {
-                digest.update(buffer, 0, read);
-            }
+        try (InputStream in = Files.newInputStream(path)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) digest.update(buf, 0, n);
         }
-
         return digest.digest();
-    }
-
-    public static byte[] calculateBytes(byte[] data) throws NoSuchAlgorithmException {
-        MessageDigest digest = MessageDigest.getInstance("MD5");
-        return digest.digest(data);
-    }
-
-    public static String md5Hex(Path path) throws IOException, NoSuchAlgorithmException {
-        return toHex(calculateFile(path));
-    }
-
-    public static String toHex(byte[] bytes) {
-        if (bytes == null) {
-            return "";
-        }
-
-        StringBuilder builder = new StringBuilder(bytes.length * 2);
-        for (byte value : bytes) {
-            builder.append(String.format("%02x", value & 0xFF));
-        }
-        return builder.toString();
     }
 }
