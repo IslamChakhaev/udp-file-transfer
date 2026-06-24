@@ -3,37 +3,47 @@ package udp.project.sender;
 public class SlidingWindow {
 
     private final int maxSeq;
-    private int baseSeq = 1;
-    private int nextSeq = 1;
+    private int firstUnackedSeq = 1;
+    private int nextSeqToSend = 1;
 
     public SlidingWindow(int maxSeq) {
         this.maxSeq = maxSeq;
     }
 
+    // Prüft, ob noch ein neues DATA-Paket ins aktuelle Fenster passt.
     public boolean canSend(int windowSize) {
-        return windowSize > 0 && nextSeq <= maxSeq && nextSeq < baseSeq + windowSize;
+        return windowSize > 0
+                && nextSeqToSend <= maxSeq
+                && nextSeqToSend < firstUnackedSeq + windowSize;
     }
 
+    // Gibt die nächste DATA-Sequenz zurück, die gesendet werden soll.
     public int nextToSend() {
-        return nextSeq;
+        return nextSeqToSend;
     }
 
+    // Markiert die aktuelle Sequenz als gesendet und geht zur nächsten weiter.
     public void markSent() {
-        nextSeq++;
+        nextSeqToSend++;
     }
 
+    // ACK bedeutet: Alle DATA-Pakete vor ackBase sind angekommen.
     public void onAck(int ackBase) {
-        if (ackBase > baseSeq && ackBase <= maxSeq + 1) {
-            baseSeq = ackBase;
-            nextSeq = Math.max(nextSeq, baseSeq);
+        if (ackBase <= firstUnackedSeq || ackBase > maxSeq + 1) {
+            return;
         }
+
+        firstUnackedSeq = ackBase;
+        nextSeqToSend = Math.max(nextSeqToSend, firstUnackedSeq);
     }
 
-    public int getBaseSeq() {
-        return baseSeq;
+    // Erstes DATA-Paket, das noch nicht bestätigt wurde.
+    public int getFirstUnackedSeq() {
+        return firstUnackedSeq;
     }
 
+    // Fertig, wenn alle DATA-Pakete bestätigt wurden.
     public boolean isFinished() {
-        return baseSeq > maxSeq;
+        return firstUnackedSeq > maxSeq;
     }
 }

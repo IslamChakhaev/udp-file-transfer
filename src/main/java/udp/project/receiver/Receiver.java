@@ -22,21 +22,15 @@ import java.util.Map;
 public class Receiver implements AutoCloseable {
 
     private static final int BUFFER_SIZE = 32_384;
-    // SOCKET_TIMEOUT_MS ist kein echter Fehler – er triggert alle 500 ms NAK-Wiederholungen und Session-Bereinigung.
     private static final int SOCKET_TIMEOUT_MS = 500;
-    private static final int SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
-    // Puffer für DATA/LAST, die vor FIRST ankommen – passiert, wenn Pakete im Netz die Reihenfolge tauschen.
     private static final int MAX_PENDING_RAW = 512;
-    // 350 seq × 4 Byte = 1400 Byte Nutzlast im NAK – passt in ein MTU-sicheres UDP-Paket.
-    private static final int MAX_NAK_SEQUENCES = 350;
-    private static final long NAK_INTERVAL_MS = 700; // Mindestabstand zwischen zwei NAKs derselben Session
+    private static final long NAK_INTERVAL_MS = 700;
 
-    // Laufzeitdaten dieser Receiver-Instanz: Socket, Zielordner und aktive Transfers.
     private final DatagramSocket socket;
     private final Path outputDirectory;
     private final long idleTimeoutMs;
     private final PacketSerializer serializer = new PacketSerializer();
-    // sessions: alle laufenden Übertragungen, key = txId (unsigned). pending: Pakete, die vor FIRST ankamen.
+
     private final Map<Integer, ReceiveSession> sessions = new HashMap<>();
     private final Map<Integer, List<byte[]>> pending = new HashMap<>();
 
@@ -50,29 +44,38 @@ public class Receiver implements AutoCloseable {
         Files.createDirectories(this.outputDirectory);
 
         this.socket = new DatagramSocket(port);
-        this.socket.setReceiveBufferSize(SOCKET_BUFFER_BYTES);
-        this.socket.setSendBufferSize(SOCKET_BUFFER_BYTES);
         this.socket.setSoTimeout(SOCKET_TIMEOUT_MS);
     }
 
-    // Empfangsschleife: jedes Paket → handle() → Control-Antworten sofort zurückschicken.
-    // SocketTimeoutException = periodischer Trigger für NAK-Wiederholungen und Session-Bereinigung.
+    // ============================================================
+    // Hauptszenario: UDP-Pakete empfangen und Control-Antworten senden
+    //
+    // 1. UDP-Paket empfangen
+    // 2. Header lesen und txId/seq bestimmen
+    // 3. FIRST startet oder bestätigt eine ReceiveSession
+    // 4. DATA/LAST werden an die passende Session weitergegeben
+    // 5. Receiver antwortet mit ACK, NAK, COMPLETE oder ERROR
+    // 6. Timeout-Takt wiederholt NAKs oder entfernt alte Sessions
+    // ============================================================
+
     public void start() throws Exception {
         System.out.printf("RX start: port=%d, output=%s%n", socket.getLocalPort(), outputDirectory);
+
         byte[] buffer = new byte[BUFFER_SIZE];
 
         while (!socket.isClosed()) {
             try {
-                DatagramPacket datagram = new DatagramPacket(buffer, buffer.length);
-                socket.receive(datagram);
-
+                // Phase 1: UDP-Paket empfangen und auf echte Paketlänge kürzen
+                DatagramPacket datagram = receive(buffer);
                 byte[] raw = Arrays.copyOf(datagram.getData(), datagram.getLength());
 
+                // Phase 2: Paket verarbeiten und alle Control-Antworten zurücksenden
                 for (ControlPacket response : handle(raw, datagram.getSocketAddress())) {
                     sendControl(response, datagram.getSocketAddress());
                 }
             } catch (SocketTimeoutException ignored) {
-                sendTimeoutResponses();
+                // Phase 3: Kein Paket angekommen -> Timeout-Takt für NAK/Cleanup nutzen
+                onTimeout();
             } catch (Exception e) {
                 System.err.println("RX error: " + e.getMessage());
             }
@@ -81,77 +84,150 @@ public class Receiver implements AutoCloseable {
 
     @Override
     public void close() {
+        // Offene .part-Dateien entfernen, wenn der Receiver beendet wird
         for (ReceiveSession session : sessions.values()) {
-            if (!session.isComplete()) session.cleanPartFile();
+            if (!session.isComplete()) {
+                session.cleanPartFile();
+            }
         }
+
         sessions.clear();
         pending.clear();
         socket.close();
     }
 
-    // Grobe Paketverteilung: FIRST startet eine Session, DATA/LAST werden an die passende Session weitergegeben.
-    // Kam DATA vor FIRST an (Netzwerk-Reorder), landet es im pending-Puffer und wird nachgeliefert.
-    // Ist eine Session schon fertig, wiederholt der Receiver das COMPLETE – der Sender könnte es verpasst haben.
+    // ============================================================
+    // Paket-Routing
+    //
+    // Hier wird noch nicht die Datei geschrieben.
+    // Der Receiver entscheidet nur:
+    // - Ist es FIRST?
+    // - Gehört es zu einer bestehenden Session?
+    // - Muss es kurz gepuffert werden?
+    // ============================================================
+
     private List<ControlPacket> handle(byte[] raw, SocketAddress remote) {
-        if (raw.length < PacketSerializer.DATA_HEADER_SIZE) return List.of();
-
-        Header header = peekHeader(raw);
-        if (header.seq == 0) return handleFirst(raw, remote, header.txId);
-
-        ReceiveSession session = sessions.get(header.unsignedTxId());
-        if (session == null) {
-            List<byte[]> list = pending.computeIfAbsent(header.unsignedTxId(), k -> new ArrayList<>());
-            if (list.size() < MAX_PENDING_RAW) list.add(raw);
+        // Zu kleine Pakete können kein gültiger DATA/FIRST/LAST-Header sein
+        if (raw.length < PacketSerializer.DATA_HEADER_SIZE) {
             return List.of();
         }
 
-        if (session.isComplete()) return List.of(ControlPacket.complete(header.txId));
+        // Phase 1: Nur txId und seq lesen, ohne das ganze Paket zu deserialisieren
+        Header header = peekHeader(raw);
+
+        // Phase 2: FIRST startet die Übertragung
+        if (header.isFirst()) {
+            return handleFirst(raw, remote, header.txId());
+        }
+
+        // Phase 3: DATA oder LAST an bestehende Session weitergeben
+        return handleDataOrLast(raw, remote, header);
+    }
+
+    private List<ControlPacket> handleFirst(byte[] raw, SocketAddress remote, short txId) {
+        try {
+            // FIRST vollständig lesen: Dateiname und maxSeq werden dort gebraucht
+            Packet first = serializer.deserialize(raw);
+
+            // Session für diese Übertragung anlegen oder vorhandene wiederverwenden
+            ReceiveSession session = sessions.computeIfAbsent(
+                    Short.toUnsignedInt(txId),
+                    id -> new ReceiveSession(txId, outputDirectory)
+            );
+
+            // FIRST verarbeiten und danach eventuell vorher gepufferte DATA/LAST nachholen
+            List<ControlPacket> responses = new ArrayList<>(session.accept(first, remote));
+            responses.addAll(processPending(session, remote));
+
+            return responses;
+        } catch (IllegalArgumentException e) {
+            // Ungültiges FIRST ignorieren
+            return List.of();
+        }
+    }
+
+    private List<ControlPacket> handleDataOrLast(byte[] raw, SocketAddress remote, Header header) {
+        ReceiveSession session = sessions.get(header.unsignedTxId());
+
+        // DATA/LAST kam vor FIRST: kurz puffern, damit UDP-Reordering nicht direkt stört
+        if (session == null) {
+            storePending(header.unsignedTxId(), raw);
+            return List.of();
+        }
+
+        // Falls COMPLETE verloren ging, kann Receiver COMPLETE erneut senden
+        if (session.isComplete()) {
+            return List.of(ControlPacket.complete(header.txId()));
+        }
 
         try {
+            // DATA/LAST mit bekanntem maxSeq deserialisieren und an Session geben
             Packet packet = serializer.deserialize(raw, session.getMaxSeq());
             return session.accept(packet, remote);
         } catch (IllegalArgumentException e) {
+            // Kaputte Pakete ignorieren
             return List.of();
         }
     }
 
-    // Session anlegen und dann alle gepufferten Pakete (pending) sofort nachverarbeiten,
-    // damit DATA/LAST-Pakete, die vor FIRST ankamen, nicht verloren gehen.
-    private List<ControlPacket> handleFirst(byte[] raw, SocketAddress remote, short txId) {
-        try {
-            Packet first = serializer.deserialize(raw);
-            ReceiveSession session = sessions.computeIfAbsent(Short.toUnsignedInt(txId),
-                    id -> new ReceiveSession(txId, outputDirectory, MAX_NAK_SEQUENCES));
+    // DATA/LAST können bei UDP kurz vor FIRST ankommen.
+    // Das ist keine Optimierung, sondern Reordering-Schutz.
+    private void storePending(int txId, byte[] raw) {
+        List<byte[]> packets = pending.computeIfAbsent(txId, id -> new ArrayList<>());
 
-            List<ControlPacket> responses = new ArrayList<>(session.accept(first, remote));
-            List<byte[]> buffered = pending.remove(Short.toUnsignedInt(txId));
-            if (buffered != null) {
-                for (byte[] packetRaw : buffered) {
-                    try {
-                        responses.addAll(session.accept(serializer.deserialize(packetRaw, session.getMaxSeq()), remote));
-                    } catch (IllegalArgumentException ignored) {
-                    }
-                }
+        // Limit verhindert, dass unbekannte txIds endlos Speicher belegen
+        if (packets.size() < MAX_PENDING_RAW) {
+            packets.add(raw);
+        }
+    }
+
+    private List<ControlPacket> processPending(ReceiveSession session, SocketAddress remote) {
+        // Gepufferte Pakete derselben Übertragung holen
+        List<byte[]> packets = pending.remove(Short.toUnsignedInt(session.txId()));
+
+        if (packets == null || packets.isEmpty()) {
+            return List.of();
+        }
+
+        List<ControlPacket> responses = new ArrayList<>();
+
+        for (byte[] raw : packets) {
+            try {
+                // Nach FIRST ist maxSeq bekannt, deshalb können DATA/LAST jetzt gelesen werden
+                Packet packet = serializer.deserialize(raw, session.getMaxSeq());
+                responses.addAll(session.accept(packet, remote));
+            } catch (IllegalArgumentException ignored) {
+                // Kaputte Pakete werden ignoriert.
             }
-            return responses;
-        } catch (IllegalArgumentException e) {
-            return List.of();
         }
+
+        return responses;
     }
 
-    // Wird alle 500 ms durch den Socket-Timeout aufgerufen (kein Fehler – das ist der Takt des Receivers).
-    // Bereinigt fertige Sessions, bricht abgelaufene mit ERROR ab, sendet NAKs für aktive Sessions.
-    private void sendTimeoutResponses() throws Exception {
+    // ============================================================
+    // Timeout-Takt: NAK wiederholen oder alte Sessions löschen
+    //
+    // Socket-Timeout bedeutet hier nicht: Übertragung kaputt.
+    // Er gibt dem Receiver nur regelmäßig Zeit für:
+    // - NAK erneut senden
+    // - abgebrochene Sessions entfernen
+    // - fertige Sessions später aus der Map löschen
+    // ============================================================
+
+    private void onTimeout() throws Exception {
         long now = System.currentTimeMillis();
         Iterator<ReceiveSession> iterator = sessions.values().iterator();
 
         while (iterator.hasNext()) {
             ReceiveSession session = iterator.next();
+
+            // Fertige Session nach etwas Wartezeit entfernen
             if (session.isComplete() && now - session.getLastSeenAt() > idleTimeoutMs) {
                 iterator.remove();
                 continue;
             }
 
+            // Unfertige Session ohne neue Pakete abbrechen
             if (now - session.getLastSeenAt() > idleTimeoutMs) {
                 sendControl(ControlPacket.error(session.txId(), "Transfer timeout"), session.remoteAddress());
                 session.cleanPartFile();
@@ -159,29 +235,47 @@ public class Receiver implements AutoCloseable {
                 continue;
             }
 
+            // Wenn Lücken bestehen und lange nichts Neues kam, NAK erneut senden
             if (session.shouldSendNak(now, NAK_INTERVAL_MS)) {
                 sendControl(session.nak(), session.remoteAddress());
             }
         }
     }
 
-    // Sendet ACK, NAK, COMPLETE oder ERROR zurück an den Sender.
-    // Diese Control-Pakete sind das, was UDP-Übertragung hier erst zuverlässig macht.
+    // ============================================================
+    // Netzwerk-I/O
+    // ============================================================
+
+    private DatagramPacket receive(byte[] buffer) throws Exception {
+        // Wartet auf ein UDP-Paket
+        DatagramPacket datagram = new DatagramPacket(buffer, buffer.length);
+        socket.receive(datagram);
+        return datagram;
+    }
+
     private void sendControl(ControlPacket packet, SocketAddress remote) throws Exception {
-        if (remote == null) return;
+        if (remote == null) {
+            return;
+        }
+
+        // ControlPacket in Bytes serialisieren und an Sender zurückschicken
         byte[] bytes = serializer.serialize(packet);
         DatagramPacket datagram = new DatagramPacket(bytes, bytes.length);
         datagram.setSocketAddress(remote);
         socket.send(datagram);
     }
 
-    // txId + seq schnell lesen, um das Paket zuzuordnen – ohne den Rest zu parsen.
     private Header peekHeader(byte[] raw) {
+        // Header schnell lesen: txId + seq reichen für Routing im Receiver
         ByteBuffer buffer = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
         return new Header(buffer.getShort(), buffer.getInt());
     }
 
     private record Header(short txId, int seq) {
+        boolean isFirst() {
+            return seq == 0;
+        }
+
         int unsignedTxId() {
             return Short.toUnsignedInt(txId);
         }

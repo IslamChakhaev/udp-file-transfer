@@ -7,102 +7,99 @@
 ![Window](https://img.shields.io/badge/Sliding%20Window-supported-brightgreen)
 ![Integrity](https://img.shields.io/badge/Integrity-MD5-yellow)
 
-Java/Maven-Projekt für zuverlässige Dateiübertragung über UDP.
-Die Implementierung bleibt mit einer kompatiblen Sender/Receiver-Umsetzung testbar.
+Dieses Projekt überträgt Dateien über **UDP**. Da UDP selbst keine zuverlässige Übertragung garantiert, ergänzt das Projekt einen eigenen einfachen Mechanismus für Reihenfolge, Bestätigung, erneutes Senden und Integritätsprüfung.
 
-## Warum UDP allein nicht reicht
+Der Sender zerlegt eine Datei in mehrere Pakete. Der Receiver setzt diese Pakete wieder zusammen und speichert die Datei erst dann endgültig, wenn sie vollständig angekommen ist und der MD5-Hash stimmt.
 
-UDP liefert keine Garantien: Pakete können verloren gehen, doppelt ankommen oder
-in der falschen Reihenfolge eintreffen. Dieses Projekt setzt daher eigene Mechanismen
-obendrauf — Sequenznummern, ACK/NAK-Feedback, Sliding Window, Retransmission und
-MD5-Integritätsprüfung.
+## Idee des Projekts
 
-## Protokollablauf
+UDP ist schnell, garantiert aber nicht, dass Pakete ankommen, nur einmal ankommen oder in der richtigen Reihenfolge eintreffen. Für eine Dateiübertragung reicht reines UDP deshalb nicht aus.
 
-Der Sender schickt drei Pakettypen (alle in Big-Endian):
+Deshalb verwendet dieses Projekt zusätzlich zu UDP:
 
-- **FIRST** (seq=0): startet die Übertragung, enthält Dateiname und Anzahl der Chunks
-- **DATA** (seq 1..maxSeq): je bis zu 1400 Byte Nutzdaten
-- **LAST** (seq=maxSeq+1): schließt ab, enthält den 16-Byte-MD5-Hash der Datei
+- Sequenznummern für die richtige Reihenfolge der Datenpakete
+- ACK-Pakete für bestätigte Daten
+- NAK-Pakete für fehlende Daten
+- Sliding Window für mehrere gleichzeitig gesendete Pakete
+- Retransmission für erneutes Senden verlorener Pakete
+- MD5 zur Prüfung, ob die empfangene Datei dem Original entspricht
 
-Der Receiver antwortet mit Control-Paketen:
-
-- **ACK** (Code 2): alles bis ackBase−1 angekommen (kumulativ)
-- **NAK** (Code 0): Liste fehlender Sequenznummern — Sender schickt sie erneut
-- **COMPLETE** (Code 1): Datei vollständig und MD5 verifiziert
-- **ERROR** (Code 3): Fehler (Timeout, MD5-Fehler o. ä.)
-
-## Sliding Window und Retransmission
-
-Der Sender hält bis zu 64 DATA-Pakete gleichzeitig „in flight", ohne auf ein ACK
-zu warten. Das Congestion Window (`cwnd`) startet bei 8, wächst pro ACK um 1 und
-wird bei NAK oder Timeout halbiert.
-
-Zwei Retransmit-Mechanismen:
-- **RTO**: Ältestes Paket ohne ACK nach `rtoMs` erneut senden; RTO verdoppelt sich
-  bei Timeout (Exponential Backoff, max. 3 s).
-- **Fast Retransmit**: Drei gleiche ACKs mit derselben ackBase → sofortiger Retransmit.
-
-## MD5-Prüfung
-
-Der Sender berechnet den Hash vor dem Senden und schickt ihn im LAST-Paket mit.
-Der Receiver prüft ihn nach dem Zusammensetzen. Stimmen die Hashes nicht überein,
-wird die `.part`-Datei gelöscht.
-
-## Ablauf im Code
-
-```
-MainTX → Sender.sendFile()
-           → FIRST senden
-           → sendWithWindow(): DATA per Sliding Window, auf ACK/NAK/COMPLETE warten
-
-MainRX → Receiver.start()
-           → handle() → ReceiveSession.accept()
-                          ├─ FIRST:  .part-Datei anlegen
-                          ├─ DATA:   Chunk per seek+write in .part schreiben
-                          ├─ LAST:   MD5-Hash merken
-                          └─ Alle Chunks da: MD5 prüfen, Datei atomar umbenennen, COMPLETE
-```
-
-DATA oder LAST vor FIRST (Netzwerk-Reorder): gepuffert im `pending`-Map, sofort
-nachverarbeitet, sobald FIRST eintrifft.
 
 ## Projektstruktur
 
-```
+```text
 src/main/java/udp/project/
-├── MainTX.java / MainRX.java       CLI-Einstiegspunkte
-├── protocol/                       Packet, ControlPacket, PacketSerializer
-├── sender/                         Sender (Sliding Window, RTO, Fast Retransmit)
-│                                   SlidingWindow
-├── receiver/                       Receiver (Empfangsschleife, Session-Dispatching)
-│                                   ReceiveSession (.part-Datei, MD5-Prüfung)
-└── utils/Md5Util.java
+├── MainRX.java              # startet den Receiver
+├── MainTX.java              # startet den Sender
+├── protocol/                # Pakettypen und Serialisierung
+├── sender/                  # Sendelogik und Sliding Window
+├── receiver/                # Empfangslogik und Dateiaufbau
+└── utils/                   # MD5-Hilfsfunktionen
 ```
 
-## Starten
+Wichtige Klassen:
+
+| Klasse | Aufgabe |
+|---|---|
+| `MainRX` | Startet den Receiver. |
+| `MainTX` | Startet den Sender. |
+| `Sender` | Sendet FIRST, DATA, LAST und reagiert auf ACK, NAK, COMPLETE und ERROR. |
+| `Receiver` | Empfängt UDP-Pakete und verwaltet laufende Übertragungen. |
+| `ReceiveSession` | Baut aus empfangenen DATA-Paketen wieder eine Datei zusammen. |
+| `SlidingWindow` | Merkt, welche DATA-Pakete bereits gesendet und bestätigt wurden. |
+| `PacketSerializer` | Wandelt Pakete in Bytes und Bytes wieder in Objekte um. |
+| `Md5Util` | Berechnet MD5-Hashes. |
+
+## Protokoll
+
+Die Übertragung arbeitet mit Datenpaketen vom Sender zum Receiver und Kontrollpaketen vom Receiver zurück zum Sender.
+
+**Sender -> Receiver**
+
+| Paket | Bedeutung |
+|---|---|
+| `FIRST` | Startet eine neue Übertragung. Enthält Dateiname und Anzahl der DATA-Pakete. |
+| `DATA` | Enthält einen Teil der Datei. Jedes DATA-Paket hat eine Sequenznummer. |
+| `LAST` | Beendet die Datenphase und enthält den MD5-Hash der Originaldatei. |
+
+**Receiver -> Sender**
+
+| Paket | Bedeutung |
+|---|---|
+| `ACK` | Bestätigt korrekt empfangene Pakete. |
+| `NAK` | Fordert fehlende Pakete erneut an. |
+| `COMPLETE` | Meldet, dass die Datei vollständig und korrekt angekommen ist. |
+| `ERROR` | Meldet einen Fehler beim Receiver. |
+
+Alle Zahlen werden in **Big-Endian** übertragen. DATA-Pakete verwenden Sequenznummern ab `1`. Das FIRST-Paket verwendet `seq = 0`, das LAST-Paket kommt nach den DATA-Paketen.
+
+## Ablauf
+
+1. Der Sender liest die Datei, berechnet den MD5-Hash und teilt die Datei in DATA-Pakete auf.
+2. Danach sendet er FIRST, damit der Receiver eine neue Übertragung vorbereiten kann.
+3. Anschließend sendet der Sender mehrere DATA-Pakete über ein Sliding Window.
+4. Der Receiver bestätigt empfangene Pakete mit ACK und fordert fehlende Pakete mit NAK erneut an.
+5. Fehlende Pakete werden vom Sender erneut gesendet.
+6. Am Ende sendet der Sender LAST mit dem MD5-Hash.
+7. Der Receiver prüft die Datei und sendet COMPLETE, wenn alles korrekt ist.
+
+
+## Start
+
+--- Compile ---
 
 ```bash
-mvn clean package -q
+javac -d out -sourcepath src/main/java src/main/java/udp/project/MainRX.java src/main/java/udp/project/MainTX.java
 ```
 
-**Receiver:**
+--- Receiver ---
 ```bash
-java -cp target/udp-1.0-SNAPSHOT.jar udp.project.MainRX <port> [outputDir] [idleTimeoutMs]
+java -cp out udp.project.MainRX 9000 received 40000
 ```
-
-**Sender:**
+--- Sender ---
 ```bash
-java -cp target/udp-1.0-SNAPSHOT.jar udp.project.MainTX <host> <port> <datei> [delayMs] [txId]
+java -cp out udp.project.MainTX 127.0.0.1 9000 test.txt 1
 ```
+## Kompatibilität
 
-Ohne Argumente startet jeweils ein interaktiver Modus.
-
-## Bekannte Einschränkungen
-
-- Keine Verschlüsselung; Daten im Klartext.
-- txId ist 16 Bit; bei zufälliger Wahl sehr geringe Kollisionswahrscheinlichkeit.
-- Dateinamen mit `../` werden per Directory-Traversal-Schutz abgelehnt.
-- Unvollständige `.part`-Dateien werden bei Timeout oder MD5-Fehler gelöscht.
-
-→ [TESTING.md](TESTING.md)
+Normalerweise werden Sender und Receiver aus diesem Projekt zusammen verwendet. Eine andere Implementierung kann aber ebenfalls funktionieren, wenn sie dasselbe Binärprotokoll nutzt: FIRST, DATA, LAST, ACK, NAK, COMPLETE, Sequenznummern, Big-Endian und eine passende DATA-Größe.
