@@ -44,48 +44,39 @@ public class ReceiveSession {
     }
 
     // ============================================================
-    // Hauptszenario: FIRST, DATA oder LAST verarbeiten
+    // Hauptablauf einer Dateiübertragung
     //
-    // 1. Remote-Adresse und Aktivitätszeit merken
-    // 2. FIRST initialisiert die Dateiübertragung
-    // 3. DATA schreibt einen Chunk an die richtige Position
-    // 4. LAST liefert den erwarteten MD5-Wert
-    // 5. Danach entscheidet die Session: ACK, NAK, COMPLETE oder ERROR
+    // FIRST -> Transfer vorbereiten
+    // DATA  -> Chunk in .part-Datei schreiben
+    // LAST  -> erwartete MD5-Prüfsumme merken
+    // Danach -> ACK, NAK, COMPLETE oder ERROR zurückgeben
     // ============================================================
 
     public List<ControlPacket> accept(Packet packet, SocketAddress remote) {
-        // Phase 1: Sender-Adresse und letzte Aktivität aktualisieren
         this.remoteAddress = remote;
         this.lastSeenAt = System.currentTimeMillis();
 
         try {
-            // Phase 2: Paket nach Typ verarbeiten
             switch (packet.type()) {
                 case FIRST -> onFirst(packet);
                 case DATA -> onData(packet);
                 case LAST -> onLast(packet);
             }
 
-            // Phase 3: passende Antwort für Sender erzeugen
             return response(packet.type());
         } catch (Exception e) {
-            // Bei Fehler unfertige .part-Datei entfernen und ERROR senden
             cleanPartFile();
             return List.of(ControlPacket.error(txId, e.getMessage()));
         }
     }
 
     public ControlPacket nak() {
-        // Zeitpunkt merken, damit NAK nicht zu oft wiederholt wird
         lastNakAt = System.currentTimeMillis();
         return ControlPacket.nak(txId, missingSequences());
     }
 
     public boolean shouldSendNak(long now, long intervalMs) {
-        // NAK erneut senden, wenn die Session offen ist und länger nichts Neues kam
-        return firstReceived
-                && !complete
-                && remoteAddress != null
+        return firstReceived && !complete && remoteAddress != null
                 && now - lastSeenAt >= intervalMs
                 && now - lastNakAt >= intervalMs;
     }
@@ -93,12 +84,14 @@ public class ReceiveSession {
     public void cleanPartFile() {
         closePart();
 
-        if (partFile != null) {
-            try {
-                Files.deleteIfExists(partFile);
-            } catch (IOException ignored) {
-                // Cleanup darf den Receiver nicht beenden.
-            }
+        if (partFile == null) {
+            return;
+        }
+
+        try {
+            Files.deleteIfExists(partFile);
+        } catch (IOException ignored) {
+            // Cleanup darf den Receiver nicht beenden.
         }
     }
 
@@ -123,15 +116,10 @@ public class ReceiveSession {
     }
 
     // ============================================================
-    // Paketverarbeitung
-    //
-    // FIRST: Dateiname und Anzahl der DATA-Pakete
-    // DATA : eigentlicher Dateiausschnitt
-    // LAST : MD5-Prüfsumme für die komplette Datei
+    // FIRST / DATA / LAST
     // ============================================================
 
     private void onFirst(Packet packet) throws IOException {
-        // FIRST kann durch Wiederholung erneut kommen. Dann nichts neu initialisieren.
         if (firstReceived) {
             return;
         }
@@ -140,62 +128,42 @@ public class ReceiveSession {
             throw new IOException("Invalid maxSeq");
         }
 
-        // Metadaten der Übertragung übernehmen
-        this.fileName = packet.fileName();
-        this.maxSeq = packet.maxSequenceNumber();
+        fileName = packet.fileName();
+        maxSeq = packet.maxSequenceNumber();
+        received = new BitSet(maxSeq + 1);
 
-        // Empfangsstatus für DATA-Pakete vorbereiten
-        this.received = new BitSet(maxSeq + 1);
+        partFile = outputDirectory.resolve(".udp-" + Short.toUnsignedInt(txId) + ".part");
+        partRaf = new RandomAccessFile(partFile.toFile(), "rw");
+        partRaf.setLength(0);
 
-        // Temporäre Datei anlegen, bis MD5 erfolgreich geprüft wurde
-        this.partFile = outputDirectory.resolve(".udp-" + Short.toUnsignedInt(txId) + ".part");
-        this.partRaf = new RandomAccessFile(partFile.toFile(), "rw");
-        this.partRaf.setLength(0);
+        firstReceived = true;
 
-        this.firstReceived = true;
-
-        System.out.printf(
-                "RX FIRST: file=%s, txId=%d, chunks=%d%n",
-                fileName,
-                Short.toUnsignedInt(txId),
-                maxSeq
-        );
+        System.out.printf("RX FIRST: file=%s, txId=%d, chunks=%d%n", fileName, Short.toUnsignedInt(txId), maxSeq);
     }
 
     private void onData(Packet packet) throws IOException {
-        // DATA darf erst nach FIRST verarbeitet werden
         if (!firstReceived || partRaf == null) {
             return;
         }
 
         int seq = packet.sequenceNumber();
 
-        // Ungültige Sequenzen oder leere Daten ignorieren
-        if (seq < 1 || seq > maxSeq || packet.data() == null) {
+        if (seq < 1 || seq > maxSeq || packet.data() == null || received.get(seq)) {
             return;
         }
 
-        // Doppelte DATA-Pakete nicht noch einmal schreiben
-        if (received.get(seq)) {
-            return;
-        }
-
-        // Chunk an die richtige Position schreiben. Reihenfolge der UDP-Pakete ist egal.
         partRaf.seek((long) (seq - 1) * CHUNK_SIZE);
         partRaf.write(packet.data());
 
-        // Sequenz als empfangen markieren
         received.set(seq);
         receivedCount++;
     }
 
     private void onLast(Packet packet) {
-        // LAST muss nach FIRST kommen und direkt nach der letzten DATA-Sequenz liegen
         if (!firstReceived || packet.sequenceNumber() != maxSeq + 1) {
             return;
         }
 
-        // MD5 muss genau 16 Bytes haben
         if (packet.md5() == null || packet.md5().length != MD5_SIZE) {
             return;
         }
@@ -205,11 +173,11 @@ public class ReceiveSession {
     }
 
     // ============================================================
-    // ACK / NAK / COMPLETE
+    // Antwort an den Sender
     //
-    // ACK      -> Receiver bestätigt fortlaufend empfangene DATA
-    // NAK      -> Receiver nennt konkrete fehlende DATA-Sequenzen
-    // COMPLETE -> Datei ist vollständig und MD5 stimmt
+    // COMPLETE -> Datei vollständig und MD5 korrekt
+    // NAK      -> LAST kam, aber DATA fehlen noch
+    // ACK      -> nächstes erwartetes DATA-Paket
     // ============================================================
 
     private List<ControlPacket> response(PacketType latestType) throws Exception {
@@ -217,32 +185,28 @@ public class ReceiveSession {
             return List.of();
         }
 
-        // Wenn DATA vollständig sind und LAST da ist, Datei final prüfen und abschließen
         if (readyToFinish()) {
             Path finalPath = finishFile();
             complete = true;
+
             System.out.printf("RX complete: saved=%s%n", finalPath.toAbsolutePath());
             return List.of(ControlPacket.complete(txId));
         }
 
-        // Nach LAST oder wenn LAST schon da war, fehlen noch DATA -> NAK senden
         if (latestType == PacketType.LAST || lastReceived) {
             return List.of(nak());
         }
 
-        // Normalfall während DATA: kumulativen ACK senden
         return List.of(ControlPacket.ack(txId, ackBase()));
     }
 
     private boolean readyToFinish() {
-        // Fertig erst, wenn FIRST, alle DATA und LAST vorhanden sind
         return firstReceived && lastReceived && receivedCount == maxSeq && !complete;
     }
 
     private int ackBase() {
         int seq = 1;
 
-        // Erste fehlende DATA-Sequenz suchen
         while (seq <= maxSeq && received.get(seq)) {
             seq++;
         }
@@ -253,7 +217,6 @@ public class ReceiveSession {
     private List<Integer> missingSequences() {
         List<Integer> missing = new ArrayList<>();
 
-        // Fehlende DATA-Sequenzen sammeln, damit Sender sie erneut senden kann
         for (int seq = 1; seq <= maxSeq && missing.size() < MAX_NAK_SEQUENCES; seq++) {
             if (!received.get(seq)) {
                 missing.add(seq);
@@ -266,36 +229,30 @@ public class ReceiveSession {
     // ============================================================
     // Datei abschließen
     //
-    // 1. .part-Datei schließen
-    // 2. MD5 prüfen
-    // 3. freien Zielpfad bestimmen
-    // 4. .part-Datei in endgültige Datei umbenennen
+    // .part schließen -> MD5 prüfen -> freien Dateinamen finden -> umbenennen
     // ============================================================
 
     private Path finishFile() throws Exception {
         closePart();
 
-        // MD5 schützt davor, eine beschädigte Datei als fertig zu speichern
         if (!Arrays.equals(Md5Util.calculateFile(partFile), expectedMd5)) {
             Files.deleteIfExists(partFile);
             throw new IOException("MD5 mismatch");
         }
 
-        // Zielpfad bestimmen und .part-Datei final speichern
         Path finalPath = freePath(outputDirectory.resolve(fileName));
         Files.move(partFile, finalPath);
+
         return finalPath;
     }
 
     private Path freePath(Path path) throws IOException {
         path = path.toAbsolutePath().normalize();
 
-        // Schutz: Datei darf nur direkt im outputDirectory gespeichert werden
         if (!path.getParent().equals(outputDirectory)) {
             throw new IOException("Unsafe output path");
         }
 
-        // Wenn der Name frei ist, kann er direkt verwendet werden
         if (!Files.exists(path)) {
             return path;
         }
@@ -305,7 +262,6 @@ public class ReceiveSession {
         String name = dot > 0 ? currentName.substring(0, dot) : currentName;
         String ext = dot > 0 ? currentName.substring(dot) : "";
 
-        // Wenn Datei existiert, Namen mit _1, _2, ... erzeugen
         for (int i = 1; i < 10_000; i++) {
             Path candidate = outputDirectory.resolve(name + "_" + i + ext).toAbsolutePath().normalize();
 
